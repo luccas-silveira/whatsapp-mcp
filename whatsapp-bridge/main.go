@@ -13,7 +13,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -641,7 +643,14 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
+	if err != nil {
+		// Stored CDN URL can be expired (history sync); retry via direct path,
+		// which whatsmeow re-signs against the current media host.
+		fmt.Printf("Direct URL download failed (%v), retrying via direct path...\n", err)
+		downloader.URL = ""
+		mediaData, err = client.Download(context.Background(), downloader)
+	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -668,11 +677,134 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the query string: whatsmeow appends "&hash=..." to the direct path,
+	// so the oh/oe signature params have to still be there or the CDN 403s.
 	return "/" + pathPart
+}
+
+
+// --- media retry -------------------------------------------------------
+// Media that arrives via history sync carries an expired CDN token, so the
+// normal download 403s. The fix is to ask the sender's device to re-upload it
+// and download from the fresh direct path it returns.
+
+type pendingRetry struct {
+	chatJID   string
+	filename  string
+	mediaType string
+	mediaKey  []byte
+	sha256    []byte
+	encSHA256 []byte
+	length    uint64
+}
+
+var (
+	pendingRetriesMu sync.Mutex
+	pendingRetries   = map[string]pendingRetry{}
+)
+
+func requestMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) error {
+	mediaType, filename, _, mediaKey, fileSHA256, fileEncSHA256, fileLength, err := messageStore.GetMediaInfo(messageID, chatJID)
+	if err != nil {
+		return fmt.Errorf("failed to find media info: %v", err)
+	}
+	if len(mediaKey) == 0 {
+		return fmt.Errorf("no media key stored for message")
+	}
+
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return fmt.Errorf("invalid chat jid: %v", err)
+	}
+
+	var sender string
+	var isFromMe bool
+	if err := messageStore.db.QueryRow(
+		"SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?", messageID, chatJID,
+	).Scan(&sender, &isFromMe); err != nil {
+		return fmt.Errorf("failed to find message: %v", err)
+	}
+	senderJID := chat
+	if strings.Contains(sender, "@") {
+		if j, err := types.ParseJID(sender); err == nil {
+			senderJID = j
+		}
+	} else if sender != "" {
+		senderJID = types.JID{User: sender, Server: chat.Server}
+	}
+
+	info := &types.MessageInfo{
+		ID: types.MessageID(messageID),
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			Sender:   senderJID,
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+	}
+
+	pendingRetriesMu.Lock()
+	pendingRetries[messageID] = pendingRetry{
+		chatJID: chatJID, filename: filename, mediaType: mediaType,
+		mediaKey: mediaKey, sha256: fileSHA256, encSHA256: fileEncSHA256, length: fileLength,
+	}
+	pendingRetriesMu.Unlock()
+
+	return client.SendMediaRetryReceipt(context.Background(), info, mediaKey)
+}
+
+func handleMediaRetry(client *whatsmeow.Client, evt *events.MediaRetry) {
+	pendingRetriesMu.Lock()
+	p, ok := pendingRetries[string(evt.MessageID)]
+	delete(pendingRetries, string(evt.MessageID))
+	pendingRetriesMu.Unlock()
+	if !ok {
+		return
+	}
+
+	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, p.mediaKey)
+	if err != nil {
+		fmt.Printf("Media retry for %s failed: %v\n", evt.MessageID, err)
+		return
+	}
+
+	var waMediaType whatsmeow.MediaType
+	switch p.mediaType {
+	case "image":
+		waMediaType = whatsmeow.MediaImage
+	case "video":
+		waMediaType = whatsmeow.MediaVideo
+	case "audio":
+		waMediaType = whatsmeow.MediaAudio
+	default:
+		waMediaType = whatsmeow.MediaDocument
+	}
+
+	data, err := client.Download(context.Background(), &MediaDownloader{
+		DirectPath:    notif.GetDirectPath(),
+		MediaKey:      p.mediaKey,
+		FileLength:    p.length,
+		FileSHA256:    p.sha256,
+		FileEncSHA256: p.encSHA256,
+		MediaType:     waMediaType,
+	})
+	if err != nil {
+		fmt.Printf("Media retry download for %s failed: %v\n", evt.MessageID, err)
+		return
+	}
+
+	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(p.chatJID, ":", "_"))
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		fmt.Printf("Media retry mkdir failed: %v\n", err)
+		return
+	}
+	path := fmt.Sprintf("%s/%s", chatDir, p.filename)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		fmt.Printf("Media retry save failed: %v\n", err)
+		return
+	}
+	abs, _ := filepath.Abs(path)
+	fmt.Printf("Media retry succeeded: %s (%d bytes)\n", abs, len(data))
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -724,6 +856,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
+	http.HandleFunc("/api/mediaretry", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MessageID string `json:"message_id"`
+			ChatJID   string `json:"chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := requestMediaRetry(client, messageStore, req.MessageID, req.ChatJID); err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "retry requested"})
+	})
+
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
@@ -800,14 +949,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -844,6 +993,9 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			handleMediaRetry(client, v)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -906,7 +1058,13 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	apiPort := 8099
+	if v := os.Getenv("WHATSAPP_BRIDGE_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			apiPort = n
+		}
+	}
+	startRESTServer(client, messageStore, apiPort)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1131,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1146,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

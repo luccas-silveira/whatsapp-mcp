@@ -161,6 +161,12 @@ def send_message(
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
+    Messages go out as the user (Luccas) and must sound like him. Before composing any
+    text on his behalf, read /Users/luccassilveira/Code/whatsapp-mcp/ESTILO.md and his
+    last messages in this chat (list_messages with chat_jid), and write the same way:
+    short, several messages instead of one paragraph, no assistant phrasing.
+    Text he dictated verbatim goes out unchanged.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")

@@ -3,12 +3,14 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os.path
+import unicodedata
 import requests
 import json
 import audio
 
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = f"http://localhost:{os.getenv('WHATSAPP_BRIDGE_PORT', '8099')}/api"
 
 @dataclass
 class Message:
@@ -390,47 +392,61 @@ def list_chats(
             conn.close()
 
 
+def _norm(text: Optional[str]) -> str:
+    """Lowercase and strip accents, so "Taue" finds "Tauê"."""
+    return ''.join(c for c in unicodedata.normalize('NFD', text or '') if not unicodedata.combining(c)).lower()
+
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    Names come from the chat, the address book and the contact's own profile
+    (whatsapp.db), since most chats have no name stored. Phone numbers and @lid
+    identities are merged, and the returned jid is the one that holds the chat.
+    """
+    q = _norm(query).strip()
+    digits = ''.join(ch for ch in query if ch.isdigit())[-8:]
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
-        
+        chats = {jid: (name, ts) for jid, name, ts in conn.execute("SELECT jid, name, last_message_time FROM chats")}
+        conn.close()
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
+        lid_to_pn = dict(conn.execute("SELECT lid, pn FROM whatsmeow_lid_map"))
+        book = {}
+        for jid, *names in conn.execute("SELECT their_jid, full_name, push_name, business_name, first_name FROM whatsmeow_contacts"):
+            book.setdefault(jid, []).extend(n for n in names if n)
+        conn.close()
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
 
+    pn_to_lid = {pn: lid for lid, pn in lid_to_pn.items()}
+    people = {}
+    for jid in set(chats) | set(book):
+        user, _, server = jid.partition('@')
+        user = user.split(':')[0]  # drop device suffix ("123:23@lid")
+        if server == 'lid':
+            lid, pn = user, lid_to_pn.get(user)
+        elif server == 's.whatsapp.net':
+            pn, lid = user, pn_to_lid.get(user)
+        else:
+            continue
+        candidates = [j for j in (lid and f"{lid}@lid", pn and f"{pn}@s.whatsapp.net") if j]
+        key = next((j for j in candidates if j in chats), candidates[0])
+        person = people.setdefault(key, {'pn': pn, 'names': []})
+        for name in [chats.get(jid, (None,))[0]] + book.get(jid, []):
+            if name and not name.isdigit() and name not in person['names']:
+                person['names'].append(name)
+
+    def matches(key, person):
+        if digits and len(digits) >= 6 and (digits in (person['pn'] or '') or digits in key):
+            return True
+        return bool(q) and any(q in _norm(n) for n in person['names'])
+
+    found = [(k, p) for k, p in people.items() if matches(k, p)]
+    # conversations first, most recent on top
+    found.sort(key=lambda kp: str(chats.get(kp[0], (None, ''))[1] or ''), reverse=True)
+    return [Contact(phone_number=p['pn'] or k.split('@')[0], name=' / '.join(p['names']) or None, jid=k)
+            for k, p in found[:50]]
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
