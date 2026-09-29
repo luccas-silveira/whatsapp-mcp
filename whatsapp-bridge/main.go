@@ -185,9 +185,13 @@ func extractTextContent(msg *waProto.Message) string {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
+	} else if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
 	}
-
-	// For now, we're ignoring non-text messages
 	return ""
 }
 
@@ -1212,14 +1216,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
