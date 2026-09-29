@@ -46,6 +46,15 @@ Here's an example of what you can do when it's connected to Claude.
 
    After approximately 20 days, you will might need to re-authenticate.
 
+   On macOS, keep it running as a service instead: it starts at login and comes back by itself
+   after a crash, a reboot or a start without network. Run it again after every `go build`.
+
+   ```bash
+   cd whatsapp-bridge
+   go build && ./servico.sh
+   tail -f ~/Library/Logs/whatsapp-bridge.log   # QR code and errors
+   ```
+
 3. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:
