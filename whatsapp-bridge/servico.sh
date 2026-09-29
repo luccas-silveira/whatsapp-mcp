@@ -1,13 +1,14 @@
 #!/bin/bash
 # Liga a ponte como serviço do macOS: sobe no login e volta sozinha quando cai.
-# Rode de novo depois de cada `go build`. QR e erros: tail -f ~/Library/Logs/whatsapp-bridge.log
+# Compila e religa: rode de novo depois de mudar o código. QR e erros: tail -f ~/Library/Logs/whatsapp-bridge.log
 set -eu
 PASTA="$(cd "$(dirname "$0")" && pwd -P)"
 ROTULO=com.whatsapp-mcp.bridge
 PLIST="$HOME/Library/LaunchAgents/$ROTULO.plist"
 LOG="$HOME/Library/Logs/whatsapp-bridge.log"
 
-[ -x "$PASTA/whatsapp-bridge" ] || { echo "falta o binário: rode go build em $PASTA" >&2; exit 1; }
+# o módulo se chama whatsapp-client; sem -o o binário sairia com esse nome
+(cd "$PASTA" && go build -o whatsapp-bridge .)
 
 launchctl bootout "gui/$(id -u)/$ROTULO" 2>/dev/null || true
 # o bootout volta antes de o serviço sair; o bootstrap falha se ele ainda estiver lá
